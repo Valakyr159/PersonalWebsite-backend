@@ -18,11 +18,12 @@ RUN python -c "from sentence_transformers import SentenceTransformer; SentenceTr
 COPY . .
 
 # Set default env vars
-ENV PORT=7860
+ENV PORT=8000
 ENV PYTHONPATH=/app
 
-# Expose port (HuggingFace Spaces uses 7860 by default)
-EXPOSE 7860
+# Expose port (the host platform injects its own PORT at runtime and overrides
+# this default — Render, HF Spaces, etc. all set PORT dynamically)
+EXPOSE 8000
 
 # Run the server
 CMD ["python", "-m", "src.mcp_server.server"]

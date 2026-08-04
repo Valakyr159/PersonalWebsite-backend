@@ -1,0 +1,13 @@
+services:
+  - type: web
+    name: personalwebsite-backend
+    runtime: docker
+    plan: free
+    healthCheckPath: /health
+    envVars:
+      - key: GROQ_API_KEY
+        sync: false
+      - key: ALLOWED_ORIGINS
+        value: https://valakyr159.github.io
+      - key: MAX_PDF_SIZE_MB
+        value: "20"
