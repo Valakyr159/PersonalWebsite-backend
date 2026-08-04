@@ -1,8 +1,10 @@
 __pycache__/
 *.pyc
 venv/
+.venv/
 .env
 .DS_Store
+.pytest_cache/
 
 # Claude Code local settings
 .claude/

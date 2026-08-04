@@ -1,0 +1,74 @@
+# CLAUDE.md
+
+Backend del chatbot RAG del portfolio (frontend: repo hermano `../PersonalWebsite` /
+`Valakyr159/Valakyr159.github.io`). Ver `Plan.md` en ese repo para el contexto completo del proyecto.
+
+## Qué es esto
+
+Un servidor **MCP (Model Context Protocol)** sobre SSE, no una API REST. El frontend Angular se conecta
+con `@modelcontextprotocol/sdk`'s `Client` y llama tools (`upload_pdf`, `query_rag`, `clear_session`),
+no endpoints HTTP convencionales. Esta arquitectura fue una decisión deliberada de mantener (ver
+`Plan.md` del frontend) en vez de reescribir al REST+streaming que describía el `plan.md` original.
+
+## Stack
+
+Starlette + `mcp` SDK + `sentence-transformers` (embeddings locales, `all-MiniLM-L6-v2`) + `groq`
+(LLM, `llama-3.1-8b-instant`) + PyMuPDF (parseo de PDF). Todo en memoria, por sesión, sin base de datos
+— las sesiones expiran por TTL (`SessionManager.ttl`, default 1h, limpieza perezosa en cada
+`get_session()`, no hay job en background).
+
+## Estructura
+
+```
+src/mcp_server/
+  server.py             ← app Starlette, define los 3 tools MCP, rutas /sse /messages /health
+  session_manager.py    ← SessionManager singleton: chunks + embeddings + historial por sesión
+  rag_tools.py           ← generate_rag_response(): arma el prompt, llama a Groq
+  pdf_tools.py            ← extract_text_from_pdf_base64(), chunk_text(), MAX_PDF_SIZE_MB
+tests/                    ← pytest, ver más abajo
+```
+
+No existe `src/mcp_server/app/` — esa carpeta era una implementación paralela muerta (REST + LlamaIndex,
+nunca terminada, con un import roto) del prototipo original y se descartó al migrar este repo.
+
+## Correr local
+
+```bash
+python3 -m venv .venv && source .venv/bin/activate
+pip install -r requirements-dev.txt
+cp .env.example .env   # y rellenar GROQ_API_KEY
+python -m src.mcp_server.server        # sirve en :8000 (usa $PORT si está definido)
+pytest -v
+```
+
+## Variables de entorno
+
+| Variable | Default | Notas |
+|---|---|---|
+| `GROQ_API_KEY` | — | requerida para respuestas reales; sin ella, Groq devuelve error y el tool responde con un mensaje de error amigable |
+| `PORT` | 8000 local / 7860 en el Dockerfile (convención de HF Spaces) | |
+| `ALLOWED_ORIGINS` | `https://valakyr159.github.io` | CSV; añadir `http://localhost:4200` en dev si hace falta probar contra el front local |
+| `MAX_PDF_SIZE_MB` | 20 | se valida sobre el tamaño del base64 antes de parsear |
+
+## Tests
+
+`pytest` (ver `tests/conftest.py`): reemplaza `sentence_transformers.SentenceTransformer` real por un
+embedder bag-of-words determinístico antes de que `session_manager.py` lo importe — evita descargar el
+modelo real (~90MB) y depender de red en CI. Los tests de `rag_tools` mockean `Groq.chat.completions.create`
+directamente, nunca pegan a la API real.
+
+## Deploy a Hugging Face Spaces
+
+Manual, no vía CI (ver `Plan.md` del frontend, Fase 2, para los pasos completos):
+1. Crear un Space tipo Docker en huggingface.co.
+2. `git remote add space https://huggingface.co/spaces/<usuario>/<space>` y `git push space main`.
+3. Configurar `GROQ_API_KEY` y `ALLOWED_ORIGINS` como secrets del Space (nunca en el código).
+4. El `Dockerfile` ya expone el puerto 7860 (convención de HF Spaces) y pre-descarga el modelo de
+   embeddings en build time para evitar el costo en el primer request.
+
+## Gotchas conocidos
+
+- El plan de gratis de HF Spaces "duerme" el Space tras inactividad — el primer request tras dormir
+  tarda ~30s (cold start). No es un bug, es una limitación conocida del hosting gratuito.
+- CORS lee `ALLOWED_ORIGINS` en el arranque del proceso — cambiar esa variable en el Space requiere
+  reiniciar el Space, no solo guardar el secret.
