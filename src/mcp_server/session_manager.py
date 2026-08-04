@@ -1,7 +1,9 @@
 import time
 import numpy as np
 from typing import Dict, List, Any
-from sentence_transformers import SentenceTransformer
+from fastembed import TextEmbedding
+
+EMBEDDING_MODEL = "BAAI/bge-small-en-v1.5"  # ONNX Runtime, ~130MB — no PyTorch, fits Render's free 512MB tier
 
 class SessionData:
     def __init__(self):
@@ -15,8 +17,14 @@ class SessionManager:
     def __init__(self):
         self.sessions: Dict[str, SessionData] = {}
         # Pre-load embedding model
-        self.embedder = SentenceTransformer('all-MiniLM-L6-v2')
+        # threads=1: onnxruntime otherwise sizes its thread pool/memory arena to
+        # os.cpu_count(), which inflates RSS well past Render's free 512MB tier
+        # on hosts that report many cores.
+        self.embedder = TextEmbedding(model_name=EMBEDDING_MODEL, threads=1)
         self.ttl = 3600  # 1 hour TTL
+
+    def _embed(self, texts: List[str]) -> np.ndarray:
+        return np.array(list(self.embedder.embed(texts)))
 
     def get_session(self, session_id: str) -> SessionData:
         self._cleanup()
@@ -36,8 +44,7 @@ class SessionManager:
         
         # Compute embeddings for all chunks
         if chunks:
-            embeddings = self.embedder.encode(chunks, convert_to_numpy=True)
-            session.embeddings = embeddings
+            session.embeddings = self._embed(chunks)
         else:
             session.embeddings = None
 
@@ -46,7 +53,7 @@ class SessionManager:
         if not session.chunks or session.embeddings is None:
             return ""
 
-        query_embedding = self.embedder.encode(query, convert_to_numpy=True)
+        query_embedding = self._embed([query])[0]
         
         # Compute cosine similarity
         similarities = np.dot(session.embeddings, query_embedding) / (

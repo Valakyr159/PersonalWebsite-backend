@@ -12,10 +12,10 @@ no endpoints HTTP convencionales. Esta arquitectura fue una decisión deliberada
 
 ## Stack
 
-Starlette + `mcp` SDK + `sentence-transformers` (embeddings locales, `all-MiniLM-L6-v2`) + `groq`
-(LLM, `llama-3.1-8b-instant`) + PyMuPDF (parseo de PDF). Todo en memoria, por sesión, sin base de datos
-— las sesiones expiran por TTL (`SessionManager.ttl`, default 1h, limpieza perezosa en cada
-`get_session()`, no hay job en background).
+Starlette + `mcp` SDK (**pineado a `<2.0.0`**, ver Gotchas) + `fastembed` (embeddings locales vía ONNX
+Runtime, `BAAI/bge-small-en-v1.5`, **no** PyTorch) + `groq` (LLM, `llama-3.1-8b-instant`) + PyMuPDF
+(parseo de PDF). Todo en memoria, por sesión, sin base de datos — las sesiones expiran por TTL
+(`SessionManager.ttl`, default 1h, limpieza perezosa en cada `get_session()`, no hay job en background).
 
 ## Estructura
 
@@ -52,10 +52,12 @@ pytest -v
 
 ## Tests
 
-`pytest` (ver `tests/conftest.py`): reemplaza `sentence_transformers.SentenceTransformer` real por un
-embedder bag-of-words determinístico antes de que `session_manager.py` lo importe — evita descargar el
-modelo real (~90MB) y depender de red en CI. Los tests de `rag_tools` mockean `Groq.chat.completions.create`
-directamente, nunca pegan a la API real.
+`pytest` (ver `tests/conftest.py`): reemplaza `fastembed.TextEmbedding` real por un embedder
+bag-of-words determinístico antes de que `session_manager.py` lo importe — evita descargar el modelo
+real y depender de red en CI. Los tests de `rag_tools` mockean `Groq.chat.completions.create`
+directamente, nunca pegan a la API real. `tests/test_server.py` importa `server.py` de verdad (no solo
+`session_manager`/`rag_tools`/`pdf_tools` por separado) — es la única razón por la que el bug descrito
+abajo (`mcp` 2.0.0) se detectaría en CI la próxima vez.
 
 ## Deploy a Render
 
@@ -72,6 +74,19 @@ Static, que no puede correr este backend Python) — de ahí el cambio a Render.
 
 ## Gotchas conocidos
 
+- **`mcp[cli]` está pineado a `>=1.29.0,<2.0.0`, no lo subas sin revisar `server.py` primero.** La API de
+  bajo nivel de `Server` (`@app.list_tools()` / `@app.call_tool()`, que es como está escrito
+  `server.py`) fue reemplazada en `mcp` 2.0.0 (`add_request_handler`, `streamable_http_app`, sin esos
+  decoradores) — con el rango sin techo original (`>=1.0.0`) el primer deploy a Render instaló 2.0.0 y
+  el proceso ni siquiera arrancaba (`AttributeError` en el import). Ninguno de los tests de
+  `session_manager`/`rag_tools`/`pdf_tools` lo detectó porque ninguno importa `server.py` — de ahí
+  `tests/test_server.py`.
+- **`sentence-transformers` (PyTorch) se cambió por `fastembed` (ONNX Runtime) por memoria, no por
+  preferencia técnica.** El primer deploy a Render murió con "Ran out of memory (used over 512MB)"
+  porque solo importar `torch` ya consume varios cientos de MB. `fastembed` + `BAAI/bge-small-en-v1.5`
+  con `threads=1` deja el proceso en desarrollo local en ~340MB de pico (import + un embed real) — deja
+  margen bajo el límite de 512MB del free tier, pero no es holgado; si se añade otra dependencia pesada,
+  volver a medir con `resource.getrusage(resource.RUSAGE_SELF).ru_maxrss` antes de asumir que cabe.
 - El plan free de Render "duerme" el servicio tras ~15 min de inactividad — el primer request tras
   dormir tarda ~30-60s (cold start). No es un bug, es una limitación conocida del hosting gratuito.
 - CORS lee `ALLOWED_ORIGINS` en el arranque del proceso — cambiar esa variable en Render requiere que el

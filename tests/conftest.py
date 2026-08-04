@@ -1,9 +1,9 @@
 """
-Stubs out sentence-transformers with a lightweight bag-of-words embedder so
-the test suite never downloads the real ~90MB all-MiniLM-L6-v2 model. This
+Stubs out fastembed with a lightweight bag-of-words embedder so the test
+suite never downloads the real ONNX model or spins up onnxruntime. This
 module-level code runs before pytest imports any test file, which is what
-lets it intercept `from sentence_transformers import SentenceTransformer`
-inside src/mcp_server/session_manager.py.
+lets it intercept `from fastembed import TextEmbedding` inside
+src/mcp_server/session_manager.py.
 """
 import sys
 import types
@@ -21,18 +21,17 @@ def _bag_of_words_vector(text: str) -> np.ndarray:
     return vector / norm if norm > 0 else vector
 
 
-class FakeSentenceTransformer:
-    """Deterministic stand-in for sentence_transformers.SentenceTransformer."""
+class FakeTextEmbedding:
+    """Deterministic stand-in for fastembed.TextEmbedding."""
 
     def __init__(self, *_args, **_kwargs):
         pass
 
-    def encode(self, texts, convert_to_numpy: bool = True):
-        if isinstance(texts, str):
-            return _bag_of_words_vector(texts)
-        return np.array([_bag_of_words_vector(t) for t in texts])
+    def embed(self, texts):
+        for text in texts:
+            yield _bag_of_words_vector(text)
 
 
-fake_module = types.ModuleType("sentence_transformers")
-fake_module.SentenceTransformer = FakeSentenceTransformer
-sys.modules.setdefault("sentence_transformers", fake_module)
+fake_module = types.ModuleType("fastembed")
+fake_module.TextEmbedding = FakeTextEmbedding
+sys.modules.setdefault("fastembed", fake_module)
