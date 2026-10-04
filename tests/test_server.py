@@ -21,7 +21,7 @@ from src.mcp_server import server
 
 def test_server_module_imports_and_registers_routes():
     paths = {route.path for route in server.starlette_app.routes}
-    assert paths == {"/health", "/sse", "/messages"}
+    assert paths == {"/health", "/sse", "/messages", "/genshin/profile/{uid}", "/genshin/meta", "/genshin/chat"}
 
 
 def test_health_endpoint_returns_ok():

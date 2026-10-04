@@ -17,6 +17,7 @@ from mcp.types import Tool, TextContent
 from .pdf_tools import extract_text_from_pdf_base64, chunk_text, MAX_PDF_SIZE_MB
 from .session_manager import session_manager
 from .rag_tools import generate_rag_response
+from .genshin import genshin_routes
 
 # Initialize MCP Server
 app = Server("portfolio-mcp-server")
@@ -125,7 +126,8 @@ starlette_app = Starlette(
     routes=[
         Route("/health", endpoint=handle_health),
         Route("/sse", endpoint=handle_sse),
-        Route("/messages", endpoint=handle_messages, methods=["POST"])
+        Route("/messages", endpoint=handle_messages, methods=["POST"]),
+        *genshin_routes,
     ]
 )
 

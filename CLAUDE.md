@@ -25,6 +25,9 @@ src/mcp_server/
   session_manager.py    ← SessionManager singleton: chunks + embeddings + historial por sesión
   rag_tools.py           ← generate_rag_response(): arma el prompt, llama a Groq
   pdf_tools.py            ← extract_text_from_pdf_base64(), chunk_text(), MAX_PDF_SIZE_MB
+  genshin.py              ← REST (no MCP) para la guía de Genshin: /genshin/profile/{uid}, /genshin/meta
+  data/genshin_roster.json ← generado, no editar a mano (ver abajo)
+scripts/build_genshin_roster.py ← regenera el roster desde el store público de Enka
 tests/                    ← pytest, ver más abajo
 ```
 
@@ -48,6 +51,9 @@ pytest -v
 | `GROQ_API_KEY` | — | requerida para respuestas reales; sin ella, Groq devuelve error y el tool responde con un mensaje de error amigable |
 | `PORT` | 8000 | el host (Render, etc.) lo inyecta en runtime y pisa este default — no hardcodear un puerto distinto en el Dockerfile |
 | `ALLOWED_ORIGINS` | `https://valakyr159.github.io` | CSV; añadir `http://localhost:4200` en dev si hace falta probar contra el front local |
+| `GEMINI_API_KEY` | — | meta de Genshin. Local: `.env`; producción: dashboard de Render (`sync: false`) |
+| `GEMINI_MODEL` / `GEMINI_FALLBACK_MODEL` | `gemini-3.8-flash` / `gemini-3.1-flash-lite` | el de reserva se usa ante 429/503 |
+| `GENSHIN_META_SOURCES` | genshin.gg tier-list + teams + Fandom `Version` | CSV de URLs https que Gemini lee para el meta |
 | `MAX_PDF_SIZE_MB` | 20 | se valida sobre el tamaño del base64 antes de parsear |
 
 ## Tests
@@ -94,3 +100,21 @@ Static, que no puede correr este backend Python) — de ahí el cambio a Render.
 - El Dockerfile no fija el puerto a un valor específico de plataforma (antes tenía `ENV PORT=7860` para
   HF Spaces) — ahora usa `8000` como default genérico porque cada plataforma inyecta su propio `PORT`
   en runtime de todos modos.
+
+
+## Genshin (`genshin.py`)
+
+- **Perfil**: proxy a Enka.Network (`/api/uid/{uid}`). Enka exige `User-Agent` propio (el navegador no puede
+  fijarlo, de ahí el proxy) y solo devuelve la **vitrina** (hasta 8 personajes, y solo si el jugador la
+  tiene visible), nunca el roster completo. Cacheado en memoria según el `ttl` de Enka (mínimo 60 s).
+- **Meta**: Gemini con la herramienta **`url_context`** lee las páginas de `GENSHIN_META_SOURCES`. **No usar
+  `google_search`**: la clave del proyecto no tiene cuota de búsqueda (devuelve 429, probado) y activarla
+  exige facturación. `gemini-2.5-flash` ya no está disponible para claves nuevas (404 aunque aparezca en
+  `ListModels`). Tarda ~50 s en frío → el frontend necesita estado de carga; cache global de 12 h, y si
+  Gemini falla se sirve la última copia buena con `stale: true`.
+- Todo lo que devuelve el modelo se **valida contra el roster** (`validate_meta`): ids inventados o equipos
+  de menos de 4 personajes válidos se descartan. Solo se acreditan como fuentes las páginas que
+  `url_context` reportó como `SUCCESS`; si ninguna se pudo leer, el meta se rechaza.
+- Rate limit en memoria por IP (`RateLimiter`): perfil 20/min, meta 6/h. Una sola instancia (Render free).
+- Regenerar el roster cuando salga un personaje: `python scripts/build_genshin_roster.py` (también copia el
+  JSON a `../PersonalWebsite/public/genshin/roster.json`). Los viajeros no están modelados todavía.
