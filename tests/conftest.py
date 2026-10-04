@@ -7,6 +7,7 @@ src/mcp_server/session_manager.py.
 """
 import sys
 import types
+import zlib
 
 import numpy as np
 
@@ -16,7 +17,8 @@ _EMBED_DIM = 32
 def _bag_of_words_vector(text: str) -> np.ndarray:
     vector = np.zeros(_EMBED_DIM)
     for word in text.lower().split():
-        vector[hash(word) % _EMBED_DIM] += 1
+        # crc32, not hash(): str hashes are randomized per process, which made retrieval tests flaky.
+        vector[zlib.crc32(word.encode()) % _EMBED_DIM] += 1
     norm = np.linalg.norm(vector)
     return vector / norm if norm > 0 else vector
 

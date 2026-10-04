@@ -37,10 +37,17 @@ META_MIN_REFRESH_SECONDS = 3600
 # A snapshot from the backup model is lower quality (it got the banners wrong in production): keep it briefly,
 # so the next request retries the primary model instead of serving it for 12 h.
 META_DEGRADED_TTL_SECONDS = 600
+# The primary model is accurate but slow (~30-65 s) and answers 503 "high demand" in spikes. Retry it before
+# settling for the backup, inside a budget that fits the frontend's 150 s request timeout.
+META_BUDGET_SECONDS = 135
+META_PRIMARY_ATTEMPTS = 3
+META_MIN_ATTEMPT_SECONDS = 40
+META_RETRY_DELAY_SECONDS = 4
 META_DEGRADED_MIN_REFRESH_SECONDS = 60
 MIN_PROFILE_TTL = 60
 
 log = logging.getLogger(__name__)
+_sleep = asyncio.sleep  # indirection so tests don't wait
 ROSTER_PATH = Path(__file__).parent / "data" / "genshin_roster.json"
 
 
@@ -247,7 +254,7 @@ def read_sources(candidate: dict[str, Any]) -> list[dict[str, str]]:
     return sources
 
 
-async def _generate(client: httpx.AsyncClient, model: str, api_key: str, prompt: str) -> dict[str, Any]:
+async def _generate(client: httpx.AsyncClient, model: str, api_key: str, prompt: str, timeout: float = 90) -> dict[str, Any]:
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
         # url_context (not google_search): the search tool has no free quota on this key.
@@ -255,9 +262,38 @@ async def _generate(client: httpx.AsyncClient, model: str, api_key: str, prompt:
         "generationConfig": {"temperature": 0.2},
     }
     # The key goes in a header, not the URL, so it never lands in access logs.
-    response = await client.post(GEMINI_URL.format(model=model), json=body, headers={"x-goog-api-key": api_key})
+    response = await client.post(GEMINI_URL.format(model=model), json=body, headers={"x-goog-api-key": api_key}, timeout=timeout)
     response.raise_for_status()
     return (response.json().get("candidates") or [{}])[0]
+
+
+def _transient(exc: Exception) -> bool:
+    return isinstance(exc, httpx.TimeoutException) or (
+        isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (429, 503))
+
+
+async def _generate_with_fallback(api_key: str, prompt: str, models: list[str]) -> tuple[dict[str, Any], str]:
+    """Primary model with retries on transient errors, then each backup once, all within META_BUDGET_SECONDS."""
+    deadline = time.monotonic() + META_BUDGET_SECONDS
+    last: Exception | None = None
+    async with httpx.AsyncClient() as client:
+        for index, model in enumerate(models):
+            attempts = META_PRIMARY_ATTEMPTS if index == 0 else 1
+            for attempt in range(attempts):
+                remaining = deadline - time.monotonic()
+                if remaining < META_MIN_ATTEMPT_SECONDS:
+                    break  # not enough time left for a useful attempt
+                try:
+                    return await _generate(client, model, api_key, prompt, timeout=min(100, remaining)), model
+                except (httpx.HTTPError, ValueError) as exc:
+                    last = exc
+                    detail = f"HTTP {exc.response.status_code}" if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
+                    log.warning("gemini %s attempt %d/%d failed: %s", model, attempt + 1, attempts, detail)
+                    if not _transient(exc):
+                        break  # e.g. 404 (model retired): retrying is pointless, go to the next model
+                    if attempt < attempts - 1:  # no point waiting before moving on to the next model
+                        await _sleep(META_RETRY_DELAY_SECONDS * (attempt + 1))
+    raise last or httpx.TimeoutException("meta time budget exhausted")
 
 
 async def fetch_meta() -> dict[str, Any]:
@@ -268,17 +304,7 @@ async def fetch_meta() -> dict[str, Any]:
     names = ", ".join(sorted(c["name"]["en"] for c in ROSTER))
     prompt = META_PROMPT.format(names=names, sources="\n".join(f"- {u}" for u in meta_sources()))
 
-    candidate, used = None, None
-    async with httpx.AsyncClient(timeout=90) as client:
-        for model in models:
-            try:
-                candidate, used = await _generate(client, model, api_key, prompt), model
-                break
-            except httpx.HTTPStatusError as exc:
-                # Overloaded (503) or rate limited (429): try the next model, otherwise give up.
-                if exc.response.status_code not in (429, 503) or model == models[-1]:
-                    raise
-                log.warning("gemini %s unavailable (HTTP %s), trying fallback", model, exc.response.status_code)
+    candidate, used = await _generate_with_fallback(api_key, prompt, models)
     text = "".join(p.get("text", "") for p in (candidate.get("content") or {}).get("parts", []))
     meta = validate_meta(extract_json(text))
     if len(meta["teams"]) < 3:

@@ -20,7 +20,13 @@ def clean_state():
     genshin.profile_limiter._hits.clear()
     genshin.meta_limiter._hits.clear()
     genshin.chat_limiter._hits.clear()
+
+    async def no_sleep(_seconds):
+        pass
+
+    genshin._sleep = no_sleep  # retries must not make the suite wait
     yield
+    genshin._sleep = __import__("asyncio").sleep
 
 
 def mock_httpx(monkeypatch, handler):
@@ -203,20 +209,6 @@ def test_fetch_meta_reads_pages_with_url_context_and_validates(monkeypatch):
     assert len(meta["teams"]) == 3 and meta["banners"] == [VESNA]
 
 
-def test_fetch_meta_falls_back_to_second_model_on_503(monkeypatch):
-    import asyncio
-    monkeypatch.setenv("GEMINI_API_KEY", "k")
-    monkeypatch.setenv("GEMINI_MODEL", "big-model")
-    monkeypatch.setenv("GEMINI_FALLBACK_MODEL", "small-model")
-    tried = []
-
-    def handler(request):
-        tried.append(request.url.path.split("/")[-1].split(":")[0])
-        return httpx.Response(503) if len(tried) == 1 else gemini_response()
-
-    mock_httpx(monkeypatch, handler)
-    meta = asyncio.run(genshin.fetch_meta())
-    assert tried == ["big-model", "small-model"] and meta["model"] == "small-model"
 
 
 def test_fetch_meta_gives_up_when_no_page_could_be_read(monkeypatch):
@@ -227,14 +219,6 @@ def test_fetch_meta_gives_up_when_no_page_could_be_read(monkeypatch):
         asyncio.run(genshin.fetch_meta())
 
 
-def test_fetch_meta_does_not_retry_on_client_errors(monkeypatch):
-    import asyncio
-    monkeypatch.setenv("GEMINI_API_KEY", "k")
-    calls = []
-    mock_httpx(monkeypatch, lambda r: (calls.append(1), httpx.Response(404))[1])
-    with pytest.raises(httpx.HTTPStatusError):
-        asyncio.run(genshin.fetch_meta())
-    assert len(calls) == 1
 
 
 # ---------- chat ----------
@@ -334,20 +318,6 @@ def test_chat_is_rate_limited(monkeypatch):
 
 # ---------- degraded (backup model) snapshots ----------
 
-def test_fetch_meta_from_the_backup_model_is_flagged_and_asserts_no_banners(monkeypatch):
-    import asyncio
-    monkeypatch.setenv("GEMINI_API_KEY", "k")
-    monkeypatch.setenv("GEMINI_MODEL", "big")
-    monkeypatch.setenv("GEMINI_FALLBACK_MODEL", "small")
-    tried = []
-
-    def handler(request):
-        tried.append(1)
-        return httpx.Response(503) if len(tried) == 1 else gemini_response()  # REPLY lists a banner
-
-    mock_httpx(monkeypatch, handler)
-    meta = asyncio.run(genshin.fetch_meta())
-    assert meta["degraded"] is True and meta["banners"] == []
 
 
 def test_fetch_meta_from_the_primary_model_is_not_degraded(monkeypatch):
@@ -385,3 +355,109 @@ def test_degraded_refresh_never_replaces_a_good_fresh_snapshot(monkeypatch):
     body = TestClient(server.starlette_app).post("/genshin/meta?refresh=1").json()
     assert body["banners"] == [VESNA] and body["stale"] is True
     assert genshin._meta_cache["data"] is good
+
+
+# ---------- retries, fallback and time budget ----------
+
+def models_env(monkeypatch):
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "big")
+    monkeypatch.setenv("GEMINI_FALLBACK_MODEL", "small")
+
+
+def model_of(request):
+    return request.url.path.split("/")[-1].split(":")[0]
+
+
+def test_primary_model_is_retried_on_503_before_using_the_backup(monkeypatch):
+    import asyncio
+    models_env(monkeypatch)
+    tried = []
+
+    def handler(request):
+        tried.append(model_of(request))
+        return httpx.Response(503) if tried.count("big") < 3 else gemini_response()
+
+    mock_httpx(monkeypatch, handler)
+    meta = asyncio.run(genshin.fetch_meta())
+    assert tried == ["big", "big", "big"]  # third attempt succeeded: the backup was never needed
+    assert meta["model"] == "big" and meta["degraded"] is False and meta["banners"] == [VESNA]
+
+
+def test_backup_model_is_used_only_after_the_primary_exhausts_its_retries(monkeypatch):
+    import asyncio
+    models_env(monkeypatch)
+    tried = []
+
+    def handler(request):
+        tried.append(model_of(request))
+        return httpx.Response(503) if model_of(request) == "big" else gemini_response()
+
+    mock_httpx(monkeypatch, handler)
+    meta = asyncio.run(genshin.fetch_meta())
+    assert tried == ["big"] * genshin.META_PRIMARY_ATTEMPTS + ["small"]
+    assert meta["model"] == "small" and meta["degraded"] is True and meta["banners"] == []  # asserts no banners
+
+
+def test_a_timeout_counts_as_transient_and_is_retried(monkeypatch):
+    import asyncio
+    models_env(monkeypatch)
+    calls = []
+
+    def handler(request):
+        calls.append(model_of(request))
+        if len(calls) == 1:
+            raise httpx.ReadTimeout("slow", request=request)
+        return gemini_response()
+
+    mock_httpx(monkeypatch, handler)
+    meta = asyncio.run(genshin.fetch_meta())
+    assert calls == ["big", "big"] and meta["degraded"] is False
+
+
+def test_retries_back_off_with_growing_delays(monkeypatch):
+    import asyncio
+    models_env(monkeypatch)
+    delays = []
+
+    async def record(seconds):
+        delays.append(seconds)
+
+    genshin._sleep = record
+    mock_httpx(monkeypatch, lambda r: httpx.Response(503) if model_of(r) == "big" else gemini_response())
+    asyncio.run(genshin.fetch_meta())
+    # Waits grow between primary attempts, and there is no wait after the last one (the backup goes straight away).
+    assert delays == [genshin.META_RETRY_DELAY_SECONDS * n for n in (1, 2)]
+
+
+def test_non_transient_error_skips_retries_but_still_tries_the_backup(monkeypatch):
+    import asyncio
+    models_env(monkeypatch)
+    tried = []
+
+    def handler(request):
+        tried.append(model_of(request))
+        return httpx.Response(404) if model_of(request) == "big" else gemini_response()  # e.g. model retired
+
+    mock_httpx(monkeypatch, handler)
+    meta = asyncio.run(genshin.fetch_meta())
+    assert tried == ["big", "small"] and meta["degraded"] is True
+
+
+def test_gives_up_when_every_model_fails(monkeypatch):
+    import asyncio
+    models_env(monkeypatch)
+    calls = []
+    mock_httpx(monkeypatch, lambda r: (calls.append(model_of(r)), httpx.Response(404))[1])
+    with pytest.raises(httpx.HTTPStatusError):
+        asyncio.run(genshin.fetch_meta())
+    assert calls == ["big", "small"]  # a 404 is never retried
+
+
+def test_stops_when_the_time_budget_is_spent(monkeypatch):
+    import asyncio
+    models_env(monkeypatch)
+    monkeypatch.setattr(genshin, "META_BUDGET_SECONDS", genshin.META_MIN_ATTEMPT_SECONDS - 1)  # no attempt fits
+    mock_httpx(monkeypatch, lambda r: pytest.fail("no request should be made without budget"))
+    with pytest.raises(httpx.TimeoutException):
+        asyncio.run(genshin.fetch_meta())
