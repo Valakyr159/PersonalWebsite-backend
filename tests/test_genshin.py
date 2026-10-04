@@ -330,3 +330,58 @@ def test_chat_is_rate_limited(monkeypatch):
     client = TestClient(server.starlette_app)
     codes = [client.post("/genshin/chat", json=chat_body()).status_code for _ in range(genshin.chat_limiter.limit + 1)]
     assert codes[:-1] == [200] * genshin.chat_limiter.limit and codes[-1] == 429
+
+
+# ---------- degraded (backup model) snapshots ----------
+
+def test_fetch_meta_from_the_backup_model_is_flagged_and_asserts_no_banners(monkeypatch):
+    import asyncio
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    monkeypatch.setenv("GEMINI_MODEL", "big")
+    monkeypatch.setenv("GEMINI_FALLBACK_MODEL", "small")
+    tried = []
+
+    def handler(request):
+        tried.append(1)
+        return httpx.Response(503) if len(tried) == 1 else gemini_response()  # REPLY lists a banner
+
+    mock_httpx(monkeypatch, handler)
+    meta = asyncio.run(genshin.fetch_meta())
+    assert meta["degraded"] is True and meta["banners"] == []
+
+
+def test_fetch_meta_from_the_primary_model_is_not_degraded(monkeypatch):
+    import asyncio
+    monkeypatch.setenv("GEMINI_API_KEY", "k")
+    mock_httpx(monkeypatch, lambda r: gemini_response())
+    meta = asyncio.run(genshin.fetch_meta())
+    assert meta["degraded"] is False and meta["banners"] == [VESNA]
+
+
+def test_degraded_snapshot_expires_fast_and_is_retried(monkeypatch):
+    snapshots = [{"patch": "7.1", "teams": [], "degraded": True}, {"patch": "7.1", "teams": [], "degraded": False}]
+
+    async def fake_fetch():
+        return snapshots.pop(0)
+
+    monkeypatch.setattr(genshin, "fetch_meta", fake_fetch)
+    client = TestClient(server.starlette_app)
+    assert client.post("/genshin/meta").json()["degraded"] is True
+    assert client.post("/genshin/meta").json()["cached"] is True  # still inside the short window
+
+    genshin._meta_cache["at"] -= genshin.META_DEGRADED_TTL_SECONDS + 1  # window over
+    second = client.post("/genshin/meta").json()
+    assert second["cached"] is False and second["degraded"] is False  # retried, primary model answered
+
+
+def test_degraded_refresh_never_replaces_a_good_fresh_snapshot(monkeypatch):
+    good = {"patch": "7.1", "teams": [], "degraded": False, "banners": [VESNA]}
+    genshin._meta_cache.update(at=genshin.time.monotonic() - genshin.META_MIN_REFRESH_SECONDS - 5, data=good)
+
+    async def degraded_fetch():
+        return {"patch": "7.1", "teams": [], "degraded": True, "banners": []}
+
+    monkeypatch.setattr(genshin, "fetch_meta", degraded_fetch)
+    body = TestClient(server.starlette_app).post("/genshin/meta?refresh=1").json()
+    assert body["banners"] == [VESNA] and body["stale"] is True
+    assert genshin._meta_cache["data"] is good

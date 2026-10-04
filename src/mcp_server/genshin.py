@@ -34,6 +34,10 @@ UID_RE = re.compile(r"^\d{9,10}$")
 
 META_TTL_SECONDS = 12 * 3600
 META_MIN_REFRESH_SECONDS = 3600
+# A snapshot from the backup model is lower quality (it got the banners wrong in production): keep it briefly,
+# so the next request retries the primary model instead of serving it for 12 h.
+META_DEGRADED_TTL_SECONDS = 600
+META_DEGRADED_MIN_REFRESH_SECONDS = 60
 MIN_PROFILE_TTL = 60
 
 log = logging.getLogger(__name__)
@@ -283,15 +287,26 @@ async def fetch_meta() -> dict[str, Any]:
     if not meta["sources"]:
         raise ValueError("none of the meta pages could be read")  # don't present unsourced meta as current
     meta["model"] = used
+    meta["degraded"] = used != models[0]
+    if meta["degraded"]:
+        # Banners are exactly what the backup model gets wrong (stale or invented), so don't assert them.
+        meta["banners"] = []
     meta["fetchedAt"] = int(time.time())
     return meta
+
+
+def _cache_window(data: dict[str, Any], refresh: bool) -> float:
+    """How long a cached snapshot answers a request. Degraded ones expire fast and can be refreshed sooner."""
+    if data.get("degraded"):
+        return META_DEGRADED_MIN_REFRESH_SECONDS if refresh else META_DEGRADED_TTL_SECONDS
+    return META_MIN_REFRESH_SECONDS if refresh else META_TTL_SECONDS
 
 
 async def handle_meta(request: Request) -> JSONResponse:
     refresh = request.query_params.get("refresh") == "1"
     age = time.monotonic() - _meta_cache["at"]
     cached = _meta_cache["data"]
-    if cached and age < (META_MIN_REFRESH_SECONDS if refresh else META_TTL_SECONDS):
+    if cached and age < _cache_window(cached, refresh):
         return JSONResponse({**cached, "cached": True})
 
     if not meta_limiter.allow(client_ip(request)):
@@ -299,7 +314,7 @@ async def handle_meta(request: Request) -> JSONResponse:
 
     async with _meta_lock:
         # Another request may have refreshed it while we waited for the lock.
-        if _meta_cache["data"] and time.monotonic() - _meta_cache["at"] < META_MIN_REFRESH_SECONDS:
+        if _meta_cache["data"] and time.monotonic() - _meta_cache["at"] < _cache_window(_meta_cache["data"], True):
             return JSONResponse({**_meta_cache["data"], "cached": True})
         try:
             meta = await fetch_meta()
@@ -313,6 +328,9 @@ async def handle_meta(request: Request) -> JSONResponse:
             if cached:
                 return JSONResponse({**cached, "cached": True, "stale": True})
             return JSONResponse({"error": "meta_unavailable", "message": "No se pudo obtener el meta ahora mismo."}, status_code=502)
+        if meta.get("degraded") and cached and not cached.get("degraded") and age < META_TTL_SECONDS:
+            # Never replace a good, still-fresh snapshot with one from the backup model.
+            return JSONResponse({**cached, "cached": True, "stale": True})
         _meta_cache.update(at=time.monotonic(), data=meta)
         return JSONResponse({**meta, "cached": False})
 
