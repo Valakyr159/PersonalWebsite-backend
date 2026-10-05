@@ -52,7 +52,8 @@ pytest -v
 | `PORT` | 8000 | el host (Render, etc.) lo inyecta en runtime y pisa este default — no hardcodear un puerto distinto en el Dockerfile |
 | `ALLOWED_ORIGINS` | `https://valakyr159.github.io` | CSV; añadir `http://localhost:4200` en dev si hace falta probar contra el front local |
 | `GEMINI_API_KEY` | — | meta de Genshin. Local: `.env`; producción: dashboard de Render (`sync: false`) |
-| `GEMINI_MODEL` / `GEMINI_FALLBACK_MODEL` | `gemini-3.8-flash` / `gemini-3.1-flash-lite` | el de reserva se usa ante 429/503 |
+| `GEMINI_META_MODELS` / `GEMINI_CHAT_MODELS` | `gemini-3.5-flash-lite,gemini-3.1-flash-lite` | CSV, primero el principal; el siguiente se usa ante 429/503 |
+| `SUPABASE_URL` / `SUPABASE_ANON_KEY` / `GENSHIN_DB_SECRET` | — | almacén del meta y de los topes diarios; sin las tres, memoria. **Nunca la `service_role`** (ver abajo) |
 | `GENSHIN_META_SOURCES` | genshin.gg tier-list + teams + Fandom `Version` | CSV de URLs https que Gemini lee para el meta |
 | `MAX_PDF_SIZE_MB` | 20 | se valida sobre el tamaño del base64 antes de parsear |
 
@@ -102,19 +103,38 @@ Static, que no puede correr este backend Python) — de ahí el cambio a Render.
   en runtime de todos modos.
 
 
-## Genshin (`genshin.py`)
+## Genshin (`genshin.py`, `genshin_store.py`, `db/genshin_meta.sql`)
+
+**Qué dispara una llamada a Gemini (y qué no)** — es lo que cuida la cuota gratuita (500/día por modelo Lite):
+- Importar UID, marcar personajes, «¿A quién sacar?», comparar: **nunca** (Enka y el motor del navegador).
+- `POST /genshin/meta`: **solo** si no hay snapshot de menos de 12 h. Entonces lanza UNA generación en segundo
+  plano (candado), con tope diario (`META_DAILY_CAP`=6) y enfriamiento de 5 min tras un fallo. No hay botón
+  ni parámetro para forzarla. Sondear no cuesta nada: responde desde el snapshot.
+- `POST /genshin/chat`: 1 llamada por mensaje, con tope diario global (`CHAT_DAILY_CAP`=300) y 20/10 min por IP.
 
 - **Perfil**: proxy a Enka.Network (`/api/uid/{uid}`). Enka exige `User-Agent` propio (el navegador no puede
-  fijarlo, de ahí el proxy) y solo devuelve la **vitrina** (hasta 8 personajes, y solo si el jugador la
-  tiene visible), nunca el roster completo. Cacheado en memoria según el `ttl` de Enka (mínimo 60 s).
-- **Meta**: Gemini con la herramienta **`url_context`** lee las páginas de `GENSHIN_META_SOURCES`. **No usar
-  `google_search`**: la clave del proyecto no tiene cuota de búsqueda (devuelve 429, probado) y activarla
-  exige facturación. `gemini-2.5-flash` ya no está disponible para claves nuevas (404 aunque aparezca en
-  `ListModels`). Tarda ~50 s en frío → el frontend necesita estado de carga; cache global de 12 h, y si
-  Gemini falla se sirve la última copia buena con `stale: true`.
-- Todo lo que devuelve el modelo se **valida contra el roster** (`validate_meta`): ids inventados o equipos
-  de menos de 4 personajes válidos se descartan. Solo se acreditan como fuentes las páginas que
-  `url_context` reportó como `SUCCESS`; si ninguna se pudo leer, el meta se rechaza.
-- Rate limit en memoria por IP (`RateLimiter`): perfil 20/min, meta 6/h. Una sola instancia (Render free).
-- Regenerar el roster cuando salga un personaje: `python scripts/build_genshin_roster.py` (también copia el
-  JSON a `../PersonalWebsite/public/genshin/roster.json`). Los viajeros no están modelados todavía.
+  fijarlo) y solo devuelve la **vitrina** (hasta 8, si el jugador la tiene visible), nunca el roster completo.
+- **Meta** (`MetaService`): estados `fresh | updating | stale | unavailable`. `updating` trae `elapsed` (el
+  contador de la UI) y el snapshot anterior si existe (el navegador sigue mostrándolo). Gemini lee las páginas
+  de `GENSHIN_META_SOURCES` con **`url_context`** (NO `google_search`: sin cuota en este proyecto).
+- **Almacén** (`genshin_store.py`): Supabase si están las tres variables; si no, o si falla, memoria (Render
+  gratis se duerme a los 15 min y pierde memoria y disco). **El proyecto Supabase es compartido** (antes
+  `patitas-a-la-obra`, ahora «PersonalWebsite», con datos reales de otra app), así que el backend NO usa la
+  `service_role` (daría acceso a todo): usa la clave `anon`, que no puede nada por sí sola (RLS sin policies y
+  sin grants), y solo llama a funciones `genshin_*` (`SECURITY DEFINER`) que exigen `GENSHIN_DB_SECRET`; en la
+  base solo vive su SHA-256. Si el entorno de Render se filtrara, solo se podría manipular el meta de Genshin.
+  Los contadores diarios son atómicos (`genshin_bump_usage`). Ver `db/genshin_meta.sql`.
+- **Convención para ramificar más proyectos personales en ese Supabase**: prefijo por app (`foo_*`) en tablas y
+  funciones, una fila en `pw_app_access` con el hash del secreto de esa app, y solo funciones que llamen a
+  `pw_check_access('foo', p_secret)` primero. Nunca darle la `service_role` a un backend.
+- **Modelos**: `GEMINI_META_MODELS` y `GEMINI_CHAT_MODELS` (CSV, primero el principal). Por defecto
+  `gemini-3.5-flash-lite,gemini-3.1-flash-lite`: los de 20 peticiones/día (3.8/3.6/3.7/3.5 Flash) no sirven de
+  base. `gemini-2.5-flash` ya no existe para claves nuevas. Un 429 de cuota **diaria** no se reintenta.
+- **Un snapshot del modelo de reserva** (`degraded`) no afirma banners, caduca en 10 min y **nunca reemplaza**
+  uno bueno ya guardado, aunque esté caduco: uno bueno viejo vale más que uno fresco dudoso (el 3.1 Lite
+  inventó banners en producción).
+- Todo lo del modelo se **valida contra el roster** (`validate_meta`); solo se acreditan como fuentes las
+  páginas que `url_context` reportó como `SUCCESS`.
+- Los tests **nunca** llaman a la API real (la cuota es compartida con producción y con otros proyectos).
+- Regenerar el roster al salir un personaje: `python scripts/build_genshin_roster.py` (también lo copia a
+  `../PersonalWebsite/public/genshin/roster.json`). Los viajeros no están modelados.

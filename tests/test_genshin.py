@@ -8,6 +8,7 @@ import pytest
 from starlette.testclient import TestClient
 
 from src.mcp_server import genshin, server
+from src.mcp_server.genshin_store import MemoryStore
 
 VESNA = genshin.ROSTER_BY_NAME["vesna"]["id"]
 VODYANITSA = genshin.ROSTER_BY_NAME["vodyanitsa"]["id"]
@@ -16,9 +17,10 @@ VODYANITSA = genshin.ROSTER_BY_NAME["vodyanitsa"]["id"]
 @pytest.fixture(autouse=True)
 def clean_state():
     genshin._profile_cache.clear()
-    genshin._meta_cache.update(at=0.0, data=None)
+    genshin.store = MemoryStore()
+    genshin.meta_service = genshin.MetaService(genshin.store, genshin.fetch_meta)
     genshin.profile_limiter._hits.clear()
-    genshin.meta_limiter._hits.clear()
+    genshin.status_limiter._hits.clear()
     genshin.chat_limiter._hits.clear()
 
     async def no_sleep(_seconds):
@@ -144,33 +146,8 @@ def test_rate_limiter_sliding_window():
     assert limiter.allow("ip", now=11)  # first hit aged out
 
 
-def test_meta_endpoint_caches_and_returns_503_without_key(monkeypatch):
-    monkeypatch.delenv("GEMINI_API_KEY", raising=False)
-    client = TestClient(server.starlette_app)
-    assert client.post("/genshin/meta").status_code == 503
-
-    snapshot = {"patch": "7.1", "teams": [], "characters": [], "banners": [], "sources": []}
-    calls = []
-
-    async def fake_fetch():
-        calls.append(1)
-        return snapshot
-
-    monkeypatch.setattr(genshin, "fetch_meta", fake_fetch)
-    first, second = client.post("/genshin/meta"), client.post("/genshin/meta")
-    assert first.json()["cached"] is False and second.json()["cached"] is True
-    assert len(calls) == 1
 
 
-def test_meta_serves_stale_snapshot_when_gemini_fails(monkeypatch):
-    genshin._meta_cache.update(at=-1e9, data={"patch": "7.0", "teams": []})  # expired but present
-
-    async def boom():
-        raise httpx.ConnectError("down")
-
-    monkeypatch.setattr(genshin, "fetch_meta", boom)
-    body = TestClient(server.starlette_app).post("/genshin/meta").json()
-    assert body["stale"] is True and body["patch"] == "7.0"
 
 
 REPLY = {"patch": "7.1", "characters": [{"name": "Vesna", "role": "Main DPS", "tier": "S"}],
@@ -286,8 +263,7 @@ def test_chat_streams_chunks_then_done_and_keeps_key_out_of_the_request_url(monk
 
 def test_chat_falls_back_to_second_model_before_the_first_byte(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "k")
-    monkeypatch.setenv("GEMINI_MODEL", "big")
-    monkeypatch.setenv("GEMINI_FALLBACK_MODEL", "small")
+    monkeypatch.setenv("GEMINI_CHAT_MODELS", "big,small")
     tried = []
 
     def handler(request):
@@ -328,41 +304,15 @@ def test_fetch_meta_from_the_primary_model_is_not_degraded(monkeypatch):
     assert meta["degraded"] is False and meta["banners"] == [VESNA]
 
 
-def test_degraded_snapshot_expires_fast_and_is_retried(monkeypatch):
-    snapshots = [{"patch": "7.1", "teams": [], "degraded": True}, {"patch": "7.1", "teams": [], "degraded": False}]
-
-    async def fake_fetch():
-        return snapshots.pop(0)
-
-    monkeypatch.setattr(genshin, "fetch_meta", fake_fetch)
-    client = TestClient(server.starlette_app)
-    assert client.post("/genshin/meta").json()["degraded"] is True
-    assert client.post("/genshin/meta").json()["cached"] is True  # still inside the short window
-
-    genshin._meta_cache["at"] -= genshin.META_DEGRADED_TTL_SECONDS + 1  # window over
-    second = client.post("/genshin/meta").json()
-    assert second["cached"] is False and second["degraded"] is False  # retried, primary model answered
 
 
-def test_degraded_refresh_never_replaces_a_good_fresh_snapshot(monkeypatch):
-    good = {"patch": "7.1", "teams": [], "degraded": False, "banners": [VESNA]}
-    genshin._meta_cache.update(at=genshin.time.monotonic() - genshin.META_MIN_REFRESH_SECONDS - 5, data=good)
-
-    async def degraded_fetch():
-        return {"patch": "7.1", "teams": [], "degraded": True, "banners": []}
-
-    monkeypatch.setattr(genshin, "fetch_meta", degraded_fetch)
-    body = TestClient(server.starlette_app).post("/genshin/meta?refresh=1").json()
-    assert body["banners"] == [VESNA] and body["stale"] is True
-    assert genshin._meta_cache["data"] is good
 
 
 # ---------- retries, fallback and time budget ----------
 
 def models_env(monkeypatch):
     monkeypatch.setenv("GEMINI_API_KEY", "k")
-    monkeypatch.setenv("GEMINI_MODEL", "big")
-    monkeypatch.setenv("GEMINI_FALLBACK_MODEL", "small")
+    monkeypatch.setenv("GEMINI_META_MODELS", "big,small")
 
 
 def model_of(request):

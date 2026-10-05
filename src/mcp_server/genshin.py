@@ -5,7 +5,7 @@ Plain REST endpoints (not MCP tools) because the browser can't set the
 User-Agent Enka requires, and the Gemini key must never reach the frontend:
 
   GET  /genshin/profile/{uid}  proxy to Enka.Network (showcase characters only)
-  POST /genshin/meta           current meta teams, Gemini reading public meta pages (url_context)
+  POST /genshin/meta           meta state machine: serves the stored snapshot, updates it in the background if >12 h old
   POST /genshin/chat           streamed (SSE) advisor chat over the numbers the page already computed
 
 Meta is only as reliable as the sources Gemini finds, so every character is
@@ -26,24 +26,33 @@ from starlette.requests import Request
 from starlette.responses import JSONResponse, StreamingResponse
 from starlette.routing import Route
 
+from .genshin_store import Snapshot, Store, make_store
+
 ENKA_URL = "https://enka.network/api/uid/{uid}"
 ENKA_USER_AGENT = "valakyr-games-guides/1.0 (+https://valakyr159.github.io)"
 GEMINI_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:generateContent"
 GEMINI_STREAM_URL = "https://generativelanguage.googleapis.com/v1beta/models/{model}:streamGenerateContent?alt=sse"
 UID_RE = re.compile(r"^\d{9,10}$")
 
+# --- Meta lifecycle: generated on demand, only when no snapshot newer than META_TTL_SECONDS exists. ---
 META_TTL_SECONDS = 12 * 3600
-META_MIN_REFRESH_SECONDS = 3600
-# A snapshot from the backup model is lower quality (it got the banners wrong in production): keep it briefly,
-# so the next request retries the primary model instead of serving it for 12 h.
+# A snapshot from the backup model is lower quality (the first backup had wrong banners): it is only kept when
+# there is nothing better, and it expires fast so the primary model is retried soon.
 META_DEGRADED_TTL_SECONDS = 600
-# The primary model is accurate but slow (~30-65 s) and answers 503 "high demand" in spikes. Retry it before
-# settling for the backup, inside a budget that fits the frontend's 150 s request timeout.
+META_FAIL_COOLDOWN_SECONDS = 300   # after a failed generation, don't hammer the API on every poll
+SNAPSHOT_REFRESH_SECONDS = 60      # how often the in-process copy is re-read from the store
+# Models are accurate but sometimes slow and answer 503 "high demand" in spikes: retry the primary before the
+# backup, inside a time budget.
 META_BUDGET_SECONDS = 135
 META_PRIMARY_ATTEMPTS = 3
 META_MIN_ATTEMPT_SECONDS = 40
 META_RETRY_DELAY_SECONDS = 4
-META_DEGRADED_MIN_REFRESH_SECONDS = 60
+
+# --- Daily caps (global, kept in the store so restarts don't reset them). Free tier: 500 requests/day/model. ---
+META_DAILY_CAP = 6
+CHAT_DAILY_CAP = 300
+
+DEFAULT_MODELS = "gemini-3.5-flash-lite,gemini-3.1-flash-lite"  # cheapest effective ones; separate daily quotas
 MIN_PROFILE_TTL = 60
 
 log = logging.getLogger(__name__)
@@ -84,7 +93,7 @@ class RateLimiter:
 
 
 profile_limiter = RateLimiter(limit=20, window=60)
-meta_limiter = RateLimiter(limit=6, window=3600)
+status_limiter = RateLimiter(limit=120, window=60)  # the page polls while the meta updates
 chat_limiter = RateLimiter(limit=20, window=600)
 
 
@@ -232,8 +241,9 @@ def validate_meta(raw: dict[str, Any]) -> dict[str, Any]:
             "banners": sorted(set(banners)), "droppedTeams": dropped}
 
 
-_meta_cache: dict[str, Any] = {"at": 0.0, "data": None}
-_meta_lock = asyncio.Lock()
+def models_from_env(name: str) -> list[str]:
+    """Comma separated model list, primary first (GEMINI_META_MODELS / GEMINI_CHAT_MODELS)."""
+    return [m.strip() for m in os.getenv(name, DEFAULT_MODELS).split(",") if m.strip()]
 
 
 def meta_sources() -> list[str]:
@@ -268,8 +278,13 @@ async def _generate(client: httpx.AsyncClient, model: str, api_key: str, prompt:
 
 
 def _transient(exc: Exception) -> bool:
-    return isinstance(exc, httpx.TimeoutException) or (
-        isinstance(exc, httpx.HTTPStatusError) and exc.response.status_code in (429, 503))
+    """Worth retrying in seconds? A daily-quota 429 is not: it won't clear until the quota resets."""
+    if isinstance(exc, httpx.TimeoutException):
+        return True
+    if isinstance(exc, httpx.HTTPStatusError):
+        status = exc.response.status_code
+        return status == 503 or (status == 429 and "PerDay" not in exc.response.text)
+    return False
 
 
 async def _generate_with_fallback(api_key: str, prompt: str, models: list[str]) -> tuple[dict[str, Any], str]:
@@ -300,7 +315,7 @@ async def fetch_meta() -> dict[str, Any]:
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured")
-    models = [os.getenv("GEMINI_MODEL", "gemini-3.8-flash"), os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite")]
+    models = models_from_env("GEMINI_META_MODELS")
     names = ", ".join(sorted(c["name"]["en"] for c in ROSTER))
     prompt = META_PROMPT.format(names=names, sources="\n".join(f"- {u}" for u in meta_sources()))
 
@@ -321,44 +336,102 @@ async def fetch_meta() -> dict[str, Any]:
     return meta
 
 
-def _cache_window(data: dict[str, Any], refresh: bool) -> float:
-    """How long a cached snapshot answers a request. Degraded ones expire fast and can be refreshed sooner."""
-    if data.get("degraded"):
-        return META_DEGRADED_MIN_REFRESH_SECONDS if refresh else META_DEGRADED_TTL_SECONDS
-    return META_MIN_REFRESH_SECONDS if refresh else META_TTL_SECONDS
+class MetaService:
+    """
+    Owns the meta lifecycle. Reading is free (no AI); the AI is called only when no snapshot newer than
+    META_TTL_SECONDS exists, once at a time, in the background, behind a daily cap and a failure cooldown.
+
+    ensure() returns {"status", "meta", ...}:
+      fresh        snapshot younger than its TTL: served as is, zero AI calls
+      updating     a generation is running (`elapsed` seconds so far); `meta` is the previous snapshot, if any
+      stale        couldn't update (failure, cooldown or daily cap): `meta` is the last snapshot, `message` says why
+      unavailable  nothing to show yet and can't generate right now
+    """
+
+    def __init__(self, store: Store, generate, clock=time.time):
+        self.store, self.generate, self.clock = store, generate, clock
+        self._snapshot: Snapshot | None = None
+        self._loaded_at = float("-inf")
+        self._task: asyncio.Task | None = None
+        self._started_at = 0.0
+        self._cooldown_until = 0.0
+        self._lock = asyncio.Lock()
+
+    @property
+    def running(self) -> bool:
+        return self._task is not None and not self._task.done()
+
+    def _fresh(self, snap: Snapshot | None) -> bool:
+        ttl = META_DEGRADED_TTL_SECONDS if snap and snap.degraded else META_TTL_SECONDS
+        return snap is not None and self.clock() - snap.generated_at < ttl
+
+    async def _current(self) -> Snapshot | None:
+        if self._snapshot is None or self.clock() - self._loaded_at > SNAPSHOT_REFRESH_SECONDS:
+            loaded = await self.store.load()
+            if loaded and (self._snapshot is None or loaded.generated_at >= self._snapshot.generated_at):
+                self._snapshot = loaded
+            self._loaded_at = self.clock()
+        return self._snapshot
+
+    def _state(self, status: str, snap: Snapshot | None, **extra: Any) -> dict[str, Any]:
+        meta = {**snap.payload, "degraded": snap.degraded} if snap else None
+        return {"status": status, "meta": meta, **extra}
+
+    def _cannot_update(self, snap: Snapshot | None, message: str) -> dict[str, Any]:
+        return self._state("stale" if snap else "unavailable", snap, message=message)
+
+    async def ensure(self) -> dict[str, Any]:
+        snap = await self._current()
+        if self._fresh(snap) and not self.running:
+            return self._state("fresh", snap)
+        if self.running:
+            return self._state("updating", snap, elapsed=int(self.clock() - self._started_at))
+
+        async with self._lock:  # one decision at a time: no two requests may start two generations
+            snap = self._snapshot
+            if self.running:
+                return self._state("updating", snap, elapsed=int(self.clock() - self._started_at))
+            if self._fresh(snap):
+                return self._state("fresh", snap)
+            if self.clock() < self._cooldown_until:
+                return self._cannot_update(snap, "No se pudo actualizar el meta; se reintentará en unos minutos.")
+            if not await self.store.bump("meta", META_DAILY_CAP):
+                return self._cannot_update(snap, "Se alcanzó el límite diario de actualizaciones del meta.")
+            self._started_at = self.clock()
+            self._task = asyncio.create_task(self._run())
+            return self._state("updating", snap, elapsed=0)
+
+    async def _run(self) -> None:
+        try:
+            meta = await self.generate()
+        except Exception as exc:  # never let a failed generation crash the loop; the next poll reports it
+            detail = f"HTTP {exc.response.status_code}" if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
+            log.warning("genshin meta generation failed: %s", detail)
+            self._cooldown_until = self.clock() + META_FAIL_COOLDOWN_SECONDS
+            return
+
+        degraded = bool(meta.get("degraded"))
+        if degraded and self._snapshot is not None:
+            # A stale, good snapshot beats a fresh, unreliable one: keep it and retry the primary model later.
+            log.warning("genshin meta came from the backup model; keeping the existing snapshot")
+            self._cooldown_until = self.clock() + META_DEGRADED_TTL_SECONDS
+            return
+        snap = Snapshot(payload=meta, generated_at=float(meta["fetchedAt"]), degraded=degraded)
+        await self.store.save(snap)
+        self._snapshot, self._loaded_at = snap, self.clock()
+        if degraded:
+            self._cooldown_until = self.clock() + META_DEGRADED_TTL_SECONDS
+
+
+store: Store = make_store()
+meta_service = MetaService(store, fetch_meta)
 
 
 async def handle_meta(request: Request) -> JSONResponse:
-    refresh = request.query_params.get("refresh") == "1"
-    age = time.monotonic() - _meta_cache["at"]
-    cached = _meta_cache["data"]
-    if cached and age < _cache_window(cached, refresh):
-        return JSONResponse({**cached, "cached": True})
-
-    if not meta_limiter.allow(client_ip(request)):
-        return too_many(3600)
-
-    async with _meta_lock:
-        # Another request may have refreshed it while we waited for the lock.
-        if _meta_cache["data"] and time.monotonic() - _meta_cache["at"] < _cache_window(_meta_cache["data"], True):
-            return JSONResponse({**_meta_cache["data"], "cached": True})
-        try:
-            meta = await fetch_meta()
-        except RuntimeError:
-            return JSONResponse({"error": "not_configured", "message": "El análisis de meta no está configurado."}, status_code=503)
-        except (httpx.HTTPError, ValueError, KeyError) as exc:
-            # Log the cause (status code only for HTTP errors: the message can echo the request URL).
-            detail = f"HTTP {exc.response.status_code}" if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
-            log.warning("genshin meta fetch failed: %s", detail)
-            # Fall back to the last good snapshot rather than failing the page.
-            if cached:
-                return JSONResponse({**cached, "cached": True, "stale": True})
-            return JSONResponse({"error": "meta_unavailable", "message": "No se pudo obtener el meta ahora mismo."}, status_code=502)
-        if meta.get("degraded") and cached and not cached.get("degraded") and age < META_TTL_SECONDS:
-            # Never replace a good, still-fresh snapshot with one from the backup model.
-            return JSONResponse({**cached, "cached": True, "stale": True})
-        _meta_cache.update(at=time.monotonic(), data=meta)
-        return JSONResponse({**meta, "cached": False})
+    if not status_limiter.allow(client_ip(request)):
+        return too_many(60)
+    state = await meta_service.ensure()
+    return JSONResponse(state, status_code=503 if state["status"] == "unavailable" else 200)
 
 
 # ---------- Chat (Gemini, streamed) ----------
@@ -402,7 +475,7 @@ async def gemini_stream(turns: list[dict[str, Any]], context: str) -> AsyncItera
     api_key = os.getenv("GEMINI_API_KEY")
     if not api_key:
         raise RuntimeError("GEMINI_API_KEY is not configured")
-    models = [os.getenv("GEMINI_MODEL", "gemini-3.8-flash"), os.getenv("GEMINI_FALLBACK_MODEL", "gemini-3.1-flash-lite")]
+    models = models_from_env("GEMINI_CHAT_MODELS")
     body = {
         "systemInstruction": {"parts": [{"text": CHAT_SYSTEM + "\n\nCONTEXT:\n" + context}]},
         "contents": turns,
@@ -449,6 +522,9 @@ async def handle_chat(request: Request) -> Any:
         return too_many(600)
     if not os.getenv("GEMINI_API_KEY"):
         return JSONResponse({"error": "not_configured", "message": "El chat no está configurado."}, status_code=503)
+    if not await store.bump("chat", CHAT_DAILY_CAP):
+        return JSONResponse({"error": "daily_limit", "message": "El chat alcanzó su límite diario. El resto de la guía sigue funcionando; vuelve mañana."},
+                            status_code=429)
 
     async def events() -> AsyncIterator[bytes]:
         try:

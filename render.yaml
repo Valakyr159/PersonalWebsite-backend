@@ -9,6 +9,12 @@ services:
         sync: false
       - key: GEMINI_API_KEY
         sync: false
+      - key: SUPABASE_URL
+        sync: false
+      - key: SUPABASE_ANON_KEY
+        sync: false
+      - key: GENSHIN_DB_SECRET
+        sync: false
       - key: ALLOWED_ORIGINS
         value: https://valakyr159.github.io
       - key: MAX_PDF_SIZE_MB
