@@ -127,6 +127,17 @@ Static, que no puede correr este backend Python) — de ahí el cambio a Render.
 - **Convención para ramificar más proyectos personales en ese Supabase**: prefijo por app (`foo_*`) en tablas y
   funciones, una fila en `pw_app_access` con el hash del secreto de esa app, y solo funciones que llamen a
   `pw_check_access('foo', p_secret)` primero. Nunca darle la `service_role` a un backend.
+- **Personajes recién lanzados** (`enrich_with_character_pages`): las páginas de tier list y equipos de genshin.gg
+  tardan en incluirlos (Vesna y Vodyanitsa no estaban en ninguna). Dos señales: (1) los banners que lee el modelo,
+  **poco fiables** (en una prueba de 4 ejecuciones, 2 omitieron los nuevos); (2) la marca `character-new` de la
+  lista de personajes de genshin.gg, leída con una petición HTTP normal (`parse_new_characters`, con reintentos),
+  que es determinista y se guarda como `newCharacters`. Los personajes de ambas listas sin datos (ni en el tier
+  list ni en ningún equipo) se enriquecen con **una sola llamada extra** que lee sus fichas (`/characters/<slug>/`,
+  con el slug del sitio): rol y equipos. Las fichas no muestran tier, así que esos equipos/personajes salen con
+  `unranked: true` y tier `A` de relleno, y el motor los puntúa como A. Nada se inventa: los nombres se resuelven
+  contra el roster, solo cuentan las páginas que `url_context` leyó (`SUCCESS`), cada equipo debe incluir al
+  personaje de su ficha y tener 4 miembros distintos, y los roles de los asientos salen del pase principal o de
+  la ficha del propio personaje (Support por defecto). No se enriquece un meta degradado.
 - **Modelos**: `GEMINI_META_MODELS` y `GEMINI_CHAT_MODELS` (CSV, primero el principal). Por defecto
   `gemini-3.5-flash-lite,gemini-3.1-flash-lite`: los de 20 peticiones/día (3.8/3.6/3.7/3.5 Flash) no sirven de
   base. `gemini-2.5-flash` ya no existe para claves nuevas. Un 429 de cuota **diaria** no se reintenta.

@@ -22,7 +22,14 @@ def clean_state():
     genshin.meta_service = MetaService(genshin.store, genshin.fetch_meta)
     for limiter in (genshin.status_limiter, genshin.chat_limiter, genshin.profile_limiter):
         limiter._hits.clear()
+    real = genshin.fetch_new_characters
+
+    async def none():
+        return {}
+
+    genshin.fetch_new_characters = none
     yield
+    genshin.fetch_new_characters = real
 
 
 class Clock:
@@ -348,6 +355,9 @@ def test_a_daily_quota_429_is_not_retried_but_a_per_minute_one_is():
     assert genshin._transient(_status_error(429, "GenerateRequestsPerDayPerProjectPerModel-FreeTier")) is False
     assert genshin._transient(_status_error(404)) is False
     assert genshin._transient(httpx.ReadTimeout("slow")) is True
+    assert genshin._transient(httpx.ConnectError("network blip")) is True  # not just timeouts
+    assert genshin._transient(httpx.ReadError("connection dropped")) is True
+    assert genshin._transient(ValueError("bad json")) is False
 
 
 # ---------- chat daily cap ----------

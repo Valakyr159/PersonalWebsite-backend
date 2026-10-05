@@ -200,6 +200,25 @@ Do not invent data: if you are unsure, leave a character out.
 Valid character names (use these spellings): {names}"""
 
 
+# The tier list and teams pages lag behind new releases: a brand-new banner character is on neither (it was
+# missing from every generated snapshot). Each character has its own page with a role and "best teams", so for the
+# banner characters the main pass found no data for, ONE extra request reads just their pages.
+CHARACTER_PAGE = "https://genshin.gg/characters/{key}/"
+CHARACTER_LIST_URL = "https://genshin.gg/characters/"
+MAX_ENRICH = 4  # at most 4 pages / 1 extra request per generation
+UNRANKED_NOTE = "De la ficha del personaje en genshin.gg: aún no tiene tier oficial."
+
+ENRICH_PROMPT = """Read these Genshin Impact character pages and report ONLY what each page literally says:
+{pages}
+
+Return ONLY a JSON array, no prose, no markdown fences, one object per page you could read:
+{{"name": "<English character name>",
+  "role": "<the role label shown on the page: Main DPS, Sub DPS, Support or Healer, else null>",
+  "teams": [{{"name": "<team name as written on the page>", "reaction": "<reaction/archetype if the page states it, else empty>",
+              "members": ["<English name>", "<English name>", "<English name>", "<English name>"]}}]}}
+If the page does not show something use null or an empty list. Never invent teams, members or roles."""
+
+
 def extract_json(text: str) -> dict[str, Any]:
     """Pull the JSON object out of a model reply that may carry fences or prose."""
     text = re.sub(r"^```(?:json)?|```$", "", text.strip(), flags=re.MULTILINE).strip()
@@ -264,6 +283,126 @@ def read_sources(candidate: dict[str, Any]) -> list[dict[str, str]]:
     return sources
 
 
+_NEW_ANCHOR = re.compile(r'<a href="/characters/([\w-]+)/"[^>]*class="[^"]*\bcharacter-new\b[^"]*"[^>]*>(.*?)</a>', re.S)
+_NAME = re.compile(r'class="character-name">([^<]+)<')
+
+
+def parse_new_characters(html: str) -> dict[int, str]:
+    """
+    Characters genshin.gg marks as NEW in its character list (`character-new`): roster id -> the site's page slug.
+    This is a plain marker in the HTML, so unlike the banners the model reads off a wiki page it is the same every
+    time. Names are resolved against the roster; anything unknown is ignored.
+    """
+    found: dict[int, str] = {}
+    for slug, inner in _NEW_ANCHOR.findall(html):
+        name = _NAME.search(inner)
+        char = _resolve(name.group(1).strip()) if name else None
+        if char:
+            found[char["id"]] = slug
+    return found
+
+
+async def fetch_new_characters(attempts: int = 3) -> dict[int, str]:
+    """
+    One plain GET of a public page (robots.txt allows it) per generation, retried on network blips: a single dropped
+    connection would otherwise leave this 12 h snapshot without the NEW information. Failure just means no info.
+    """
+    for attempt in range(attempts):
+        try:
+            async with httpx.AsyncClient(timeout=15, headers={"User-Agent": ENKA_USER_AGENT}, follow_redirects=True) as client:
+                response = await client.get(CHARACTER_LIST_URL)
+            response.raise_for_status()
+            return parse_new_characters(response.text)
+        except Exception as exc:
+            detail = f"HTTP {exc.response.status_code}" if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
+            log.warning("genshin new-characters list unavailable (attempt %d/%d): %s", attempt + 1, attempts, detail)
+            if not _transient(exc) or attempt == attempts - 1:
+                break
+            await _sleep(1 + attempt)
+    return {}
+
+
+def _as_list(value: Any) -> list:
+    """Model output is untrusted: anything that is not a list counts as empty."""
+    return value if isinstance(value, list) else []
+
+
+def uncovered_candidates(meta: dict[str, Any]) -> list[int]:
+    """Banner and NEW characters that appear neither in the tier list nor in any team (the planner has nothing on them)."""
+    covered = {c["id"] for c in meta["characters"]} | {m["id"] for t in meta["teams"] for m in t["members"]}
+    wanted = list(dict.fromkeys([*meta["banners"], *meta.get("newCharacters", [])]))
+    return [i for i in wanted if i not in covered][:MAX_ENRICH]
+
+
+def merge_character_pages(meta: dict[str, Any], raw: Any, readable: set[int]) -> int:
+    """
+    Adds role + teams taken from the character pages for characters with no data. Returns how many characters
+    were added. Nothing here is trusted: names are resolved against the roster, only pages that were really read
+    count, every team must contain the character whose page it came from and have 4 distinct valid members.
+    Tiers are NOT invented: what comes from a character page is flagged `unranked` (the engine scores it as A).
+    """
+    roles = {"Main DPS", "Sub DPS", "Support", "Healer"}
+    known_roles = {c["id"]: c["role"] for c in meta["characters"]}
+    existing_teams = {frozenset(m["id"] for m in t["members"]) for t in meta["teams"]}
+
+    # Pass 1: which characters have a usable page, and their role. A team can reach us through ANY of its members'
+    # pages, so every page's role must be known before building seats (otherwise a seat gets the default role).
+    pages: list[tuple[dict, str | None, list]] = []
+    for entry in raw if isinstance(raw, list) else []:
+        char = _resolve(entry.get("name")) if isinstance(entry, dict) else None
+        if not char or char["id"] not in readable or char["id"] in known_roles or any(p[0] is char for p in pages):
+            continue
+        pages.append((char, entry["role"] if entry.get("role") in roles else None, _as_list(entry.get("teams"))))
+    role_of = {**known_roles, **{c["id"]: r for c, r, _ in pages if r}}
+
+    # Pass 2: teams. Pages list names only: seats take the role known for that character (main pass or its own page)
+    # and default to Support otherwise (it only affects the scoring weight of that seat).
+    in_new_teams: set[int] = set()
+    for char, _role, raw_teams in pages:
+        for team in raw_teams:
+            if not isinstance(team, dict):
+                continue
+            ids = []
+            for name in _as_list(team.get("members")):
+                match = _resolve(name)
+                if match and match["id"] not in ids:
+                    ids.append(match["id"])
+            if len(ids) != 4 or char["id"] not in ids or frozenset(ids) in existing_teams:
+                continue
+            meta["teams"].append({
+                "name": str(team.get("name") or "")[:80], "reaction": str(team.get("reaction") or "")[:60],
+                "tier": "A", "unranked": True, "note": UNRANKED_NOTE,
+                "members": [{"id": i, "role": role_of.get(i, "Support")} for i in ids]})
+            existing_teams.add(frozenset(ids))
+            in_new_teams.update(ids)
+
+    # A character counts as covered only if it actually ended up in a new team (a bare role helps no one).
+    added = 0
+    for char, role, _teams in pages:
+        if char["id"] in in_new_teams:
+            meta["characters"].append({"id": char["id"], "role": role or "Support", "tier": "A", "unranked": True})
+            added += 1
+    return added
+
+
+async def enrich_with_character_pages(meta: dict[str, Any], api_key: str, models: list[str], slugs: dict[int, str] | None = None) -> None:
+    ids = uncovered_candidates(meta)
+    if not ids:
+        return
+    slug_of = {i: (slugs or {}).get(i) or ROSTER_BY_ID[i]["key"] for i in ids if i in ROSTER_BY_ID}
+    url_of = {i: CHARACTER_PAGE.format(key=slug) for i, slug in slug_of.items()}
+    prompt = ENRICH_PROMPT.format(pages="\n".join(f"- {u}" for u in url_of.values()))
+    candidate, _ = await _generate_with_fallback(api_key, prompt, models)
+    text = "".join(p.get("text", "") for p in (candidate.get("content") or {}).get("parts", []))
+    start, end = text.find("["), text.rfind("]")
+    raw = json.loads(text[start:end + 1]) if start != -1 and end > start else []
+    pages = read_sources(candidate)
+    readable_urls = {p["url"] for p in pages}
+    readable = {i for i, u in url_of.items() if u in readable_urls}
+    if merge_character_pages(meta, raw, readable):
+        meta["sources"] = meta["sources"] + [p for p in pages if p["url"] not in {s["url"] for s in meta["sources"]}]
+
+
 async def _generate(client: httpx.AsyncClient, model: str, api_key: str, prompt: str, timeout: float = 90) -> dict[str, Any]:
     body = {
         "contents": [{"role": "user", "parts": [{"text": prompt}]}],
@@ -279,7 +418,7 @@ async def _generate(client: httpx.AsyncClient, model: str, api_key: str, prompt:
 
 def _transient(exc: Exception) -> bool:
     """Worth retrying in seconds? A daily-quota 429 is not: it won't clear until the quota resets."""
-    if isinstance(exc, httpx.TimeoutException):
+    if isinstance(exc, httpx.TransportError):  # timeouts, refused/dropped connections: a network blip
         return True
     if isinstance(exc, httpx.HTTPStatusError):
         status = exc.response.status_code
@@ -329,9 +468,17 @@ async def fetch_meta() -> dict[str, Any]:
         raise ValueError("none of the meta pages could be read")  # don't present unsourced meta as current
     meta["model"] = used
     meta["degraded"] = used != models[0]
+    new_characters = await fetch_new_characters()  # deterministic marker, independent of what the model read
+    meta["newCharacters"] = sorted(new_characters)
     if meta["degraded"]:
         # Banners are exactly what the backup model gets wrong (stale or invented), so don't assert them.
         meta["banners"] = []
+    else:
+        try:
+            await enrich_with_character_pages(meta, api_key, models, new_characters)
+        except Exception as exc:  # optional extra: never lose a good meta because of it
+            detail = f"HTTP {exc.response.status_code}" if isinstance(exc, httpx.HTTPStatusError) else type(exc).__name__
+            log.warning("genshin character-page enrichment skipped: %s", detail)
     meta["fetchedAt"] = int(time.time())
     return meta
 

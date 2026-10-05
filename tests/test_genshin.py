@@ -10,6 +10,8 @@ from starlette.testclient import TestClient
 from src.mcp_server import genshin, server
 from src.mcp_server.genshin_store import MemoryStore
 
+REAL_FETCH_NEW = genshin.fetch_new_characters
+
 VESNA = genshin.ROSTER_BY_NAME["vesna"]["id"]
 VODYANITSA = genshin.ROSTER_BY_NAME["vodyanitsa"]["id"]
 
@@ -26,9 +28,14 @@ def clean_state():
     async def no_sleep(_seconds):
         pass
 
+    async def no_new_characters():
+        return {}
+
     genshin._sleep = no_sleep  # retries must not make the suite wait
+    genshin.fetch_new_characters = no_new_characters  # a separate HTTP request: tested in test_genshin_enrich.py
     yield
     genshin._sleep = __import__("asyncio").sleep
+    genshin.fetch_new_characters = REAL_FETCH_NEW
 
 
 def mock_httpx(monkeypatch, handler):
